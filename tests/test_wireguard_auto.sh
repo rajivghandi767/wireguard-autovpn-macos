@@ -5,15 +5,13 @@
 
 set -euo pipefail
 
-# Ensure Bash 4+ is running
+# Prefer Homebrew Bash 4+ if installed, while supporting macOS /bin/bash 3.2+
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
     for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
         if [[ -x "$candidate" ]]; then
             exec "$candidate" "$0" "$@"
         fi
     done
-    echo "Error: Bash 4+ is required to run the test suite." >&2
-    exit 1
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -97,6 +95,7 @@ echo "--> 2. Security & Vulnerability Regression Tests"
 
 # 3a. Command injection in autovpn.conf must NOT execute
 PWN_FILE="$SANDBOX/pwned"
+# shellcheck disable=SC2016
 {
     printf 'WG_INTERFACE="homevpn"\n'
     printf '$(touch "%s")\n' "$PWN_FILE"
@@ -173,6 +172,7 @@ assert_eq "${TRUSTED_SSIDS[1]}" "My Lab Network" "parse_config preserves spaces 
 assert_eq "${TRUSTED_GATEWAY_MACS[0]}" "00:1a:2b:03:04:0f" "parse_config reads TRUSTED_GATEWAY_MACS"
 
 # Mock get_gateway_mac returning BSD zero-stripped MAC normalized
+# shellcheck disable=SC2329
 get_gateway_mac() {
     normalize_mac "0:1a:2b:3:4:f"
 }
@@ -189,6 +189,7 @@ else
     fail "is_trusted_network failed Gateway MAC fallback when SSID is empty/redacted"
 fi
 
+# shellcheck disable=SC2329
 get_gateway_mac() {
     normalize_mac "de:ad:be:ef:00:01"
 }
