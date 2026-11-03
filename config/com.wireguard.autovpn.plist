@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.wireguard.autovpn</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BREW_PREFIX__/bin/wireguard-auto</string>
+        <string>check</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Allow wireguard-go daemon to survive after the check script exits -->
+    <key>AbandonProcessGroup</key>
+    <true/>
+
+    <!-- Debounce trigger interval (in seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Periodic sanity check every 5 minutes -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Trigger execution whenever network state or Wi-Fi configuration changes -->
+    <key>WatchPaths</key>
+    <array>
+        <string>/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist</string>
+        <string>/Library/Preferences/SystemConfiguration/preferences.plist</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/wireguard-auto.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/wireguard-auto.log</string>
+</dict>
+</plist>

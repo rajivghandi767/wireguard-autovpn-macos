@@ -1,0 +1,8 @@
+# Never commit real WireGuard configurations or private keys
+*.conf
+!*.conf.example
+*.key
+.disabled
+
+# macOS artifacts
+.DS_Store

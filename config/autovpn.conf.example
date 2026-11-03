@@ -1,0 +1,20 @@
+# ==============================================================================
+# WireGuard Auto-Connect Configuration
+# ==============================================================================
+
+# WireGuard interface name (corresponds to <BREW_PREFIX>/etc/wireguard/<WG_INTERFACE>.conf)
+WG_INTERFACE="homevpn"
+
+# Trusted Wi-Fi networks where WireGuard should remain DISCONNECTED.
+# Add more SSIDs by placing them in quotes inside the array.
+TRUSTED_SSIDS=(
+    "Your-Home-WiFi-SSID"
+    # "Office-WiFi"
+)
+
+# Optional: Trusted Gateway MAC Addresses (ARP fallback for macOS Sequoia/Tahoe
+# if Location Services redacts SSIDs for background daemons).
+# Find your home router MAC via: arp -n $(route -n get default | awk '/gateway:/{print $2}')
+TRUSTED_GATEWAY_MACS=(
+    # "aa:bb:cc:dd:ee:ff"
+)

@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wireguard-auto: Network-Aware WireGuard Daemon & CLI for macOS (Intel & ARM64)
+# ==============================================================================
+
+set -o pipefail
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Ensure Bash 4+ is running
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+        if [[ -x "$candidate" ]]; then
+            exec "$candidate" "$0" "$@"
+        fi
+    done
+    echo "Error: Bash 4+ is required (install via 'brew install bash')." >&2
+    exit 1
+fi
+
+# Dynamically detect Homebrew prefix (Apple Silicon vs Intel)
+if [[ -d "/opt/homebrew/etc/wireguard" || -x "/opt/homebrew/bin/wg-quick" ]]; then
+    BREW_PREFIX="/opt/homebrew"
+else
+    BREW_PREFIX="/usr/local"
+fi
+
+WG_DIR="${BREW_PREFIX}/etc/wireguard"
+CONFIG_FILE="${WG_DIR}/autovpn.conf"
+WG_BIN="${BREW_PREFIX}/bin/wg"
+WG_QUICK_BIN="${BREW_PREFIX}/bin/wg-quick"
+
+LOG_FILE="/var/log/wireguard-auto.log"
+LOCK_DIR="/tmp/wireguard-auto.lock"
+TEMP_DISABLE_FLAG="/tmp/wireguard-auto.disabled"
+PERSIST_DISABLE_FLAG="${WG_DIR}/.disabled"
+
+# Load user configuration
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+else
+    echo "Error: Configuration file not found at $CONFIG_FILE" >&2
+    exit 1
+fi
+
+WG_INTERFACE="${WG_INTERFACE:-homevpn}"
+TRUSTED_SSIDS=("${TRUSTED_SSIDS[@]}")
+TRUSTED_GATEWAY_MACS=("${TRUSTED_GATEWAY_MACS[@]}")
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg"
+    if [[ -w "$LOG_FILE" || ( ! -e "$LOG_FILE" && $EUID -eq 0 ) ]]; then
+        echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+acquire_lock() {
+    local attempts=5
+    while (( attempts > 0 )); do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            return 0
+        fi
+        local mtime
+        mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
+        local now
+        now=$(date +%s)
+        if (( now - mtime > 45 )); then
+            rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 1
+        (( attempts-- ))
+    done
+    return 1
+}
+
+release_lock() {
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+is_wg_active() {
+    local name_file="/var/run/wireguard/${WG_INTERFACE}.name"
+    if [[ -f "$name_file" ]]; then
+        local iface
+        iface=$(head -n 1 "$name_file" 2>/dev/null)
+        if [[ -n "$iface" ]] && ifconfig "$iface" &>/dev/null; then
+            return 0
+        fi
+        # Clean up stale state if interface no longer exists in kernel
+        if [[ $EUID -eq 0 ]]; then
+            rm -f "$name_file" "/var/run/wireguard/${iface}.sock" 2>/dev/null || true
+        fi
+    fi
+
+    # Fallback check: interface IP address active in kernel
+    local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
+    if [[ -f "$conf_path" ]]; then
+        local ip
+        ip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$conf_path" 2>/dev/null)
+        if [[ -n "$ip" ]] && ifconfig 2>/dev/null | grep -q "inet $ip "; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_endpoint_host() {
+    local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
+    if [[ -f "$conf_path" ]]; then
+        sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*\([^:]*\):.*/\1/p' "$conf_path" 2>/dev/null
+    fi
+}
+
+get_wifi_device() {
+    /usr/sbin/networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/{getline; print $2; exit}'
+}
+
+get_current_ssid() {
+    local wifi_dev
+    wifi_dev=$(get_wifi_device)
+    wifi_dev="${wifi_dev:-en0}"
+
+    local output
+    output=$(/usr/sbin/networksetup -getairportnetwork "$wifi_dev" 2>/dev/null | sed -E 's/^Current Wi-Fi Network: //')
+    if [[ "$output" == *"You are not associated"* || "$output" == *"<redacted>"* || -z "$output" ]]; then
+        # Fallback for macOS Sonoma / Sequoia / Tahoe via ipconfig summary
+        output=$(/usr/sbin/ipconfig getsummary "$wifi_dev" 2>/dev/null | awk -F ' SSID : ' '/ SSID : / {print $2}' | head -n 1)
+        if [[ "$output" == *"<redacted>"* ]]; then
+            output=""
+        fi
+    fi
+    echo "$output"
+}
+
+get_gateway_mac() {
+    local gw_ip
+    gw_ip=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/ {print $2}')
+    if [[ -n "$gw_ip" ]]; then
+        /usr/sbin/arp -n "$gw_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}$/) print tolower($i)}' | head -n 1
+    fi
+}
+
+is_trusted_network() {
+    local current_ssid="$1"
+    if [[ -n "$current_ssid" ]]; then
+        for trusted in "${TRUSTED_SSIDS[@]}"; do
+            if [[ "$current_ssid" == "$trusted" ]]; then
+                return 0
+            fi
+        done
+    fi
+
+    if [[ "${#TRUSTED_GATEWAY_MACS[@]}" -gt 0 ]]; then
+        local gw_mac
+        gw_mac=$(get_gateway_mac)
+        if [[ -n "$gw_mac" ]]; then
+            for trusted_mac in "${TRUSTED_GATEWAY_MACS[@]}"; do
+                if [[ -n "$trusted_mac" && "$gw_mac" == "$(echo "$trusted_mac" | tr '[:upper:]' '[:lower:]')" ]]; then
+                    return 0
+                fi
+            done
+        fi
+    fi
+    return 1
+}
+
+is_disabled() {
+    [[ -f "$TEMP_DISABLE_FLAG" || -f "$PERSIST_DISABLE_FLAG" ]]
+}
+
+has_default_route() {
+    /sbin/route -n get default &>/dev/null
+}
+
+wait_for_network_readiness() {
+    local endpoint_host="$1"
+    local max_attempts=8
+    local attempt=1
+
+    while (( attempt <= max_attempts )); do
+        if has_default_route; then
+            if [[ -z "$endpoint_host" ]]; then
+                return 0
+            fi
+            if dscacheutil -q host -a name "$endpoint_host" 2>/dev/null | grep -q "ip_address:"; then
+                return 0
+            fi
+        fi
+        sleep 1
+        (( attempt++ ))
+    done
+    return 1
+}
+
+cmd_check() {
+    if ! acquire_lock; then
+        log "Another instance of wireguard-auto is running. Exiting."
+        exit 0
+    fi
+    trap release_lock EXIT
+
+    # Allow network / DHCP / VPN handshakes to settle
+    sleep 2
+
+    local current_ssid
+    current_ssid=$(get_current_ssid)
+
+    if is_disabled; then
+        log "Auto-VPN is currently paused or disabled."
+        if is_wg_active; then
+            log "Tearing down $WG_INTERFACE because auto-vpn is disabled..."
+            "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        fi
+        exit 0
+    fi
+
+    if is_trusted_network "$current_ssid"; then
+        log "Connected to trusted home network: '${current_ssid:-Gateway MAC Match}'."
+        if is_wg_active; then
+            log "Tearing down $WG_INTERFACE..."
+            "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        else
+            log "WireGuard is already down."
+        fi
+        exit 0
+    fi
+
+    if is_wg_active; then
+        local net_desc="${current_ssid:-Non-WiFi / Cellular / Ethernet}"
+        log "Away from home network ($net_desc). WireGuard ($WG_INTERFACE) is already active."
+        exit 0
+    fi
+
+    # Preflight check: Wait for default route and DNS readiness (coexisting with NordVPN auto-connect)
+    local endpoint_host
+    endpoint_host=$(get_endpoint_host)
+
+    if ! wait_for_network_readiness "$endpoint_host"; then
+        log "Network route or DNS for '$endpoint_host' is not ready yet. Postponing connection until next trigger."
+        exit 0
+    fi
+
+    local net_desc="${current_ssid:-Non-WiFi / Cellular / Ethernet}"
+    log "Away from home network ($net_desc). Bringing up WireGuard ($WG_INTERFACE)..."
+    "$WG_QUICK_BIN" up "$WG_INTERFACE"
+}
+
+cmd_pause() {
+    touch "$TEMP_DISABLE_FLAG"
+    echo "WireGuard auto-connect paused (temporary flag created at $TEMP_DISABLE_FLAG)."
+    if is_wg_active; then
+        if [[ $EUID -ne 0 ]]; then
+            echo "Elevating privileges to bring down $WG_INTERFACE..."
+            exec sudo "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        else
+            "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        fi
+    else
+        echo "WireGuard ($WG_INTERFACE) is already down."
+    fi
+    echo "Run 'wireguard-auto resume' to re-enable auto-connect."
+}
+
+cmd_resume() {
+    rm -f "$TEMP_DISABLE_FLAG" "$PERSIST_DISABLE_FLAG"
+    echo "WireGuard auto-connect resumed. Triggering network check..."
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo "$0" check
+    else
+        cmd_check
+    fi
+}
+
+cmd_disable() {
+    touch "$PERSIST_DISABLE_FLAG"
+    echo "WireGuard auto-connect persistently disabled (flag created at $PERSIST_DISABLE_FLAG)."
+    if is_wg_active; then
+        if [[ $EUID -ne 0 ]]; then
+            echo "Elevating privileges to bring down $WG_INTERFACE..."
+            exec sudo "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        else
+            "$WG_QUICK_BIN" down "$WG_INTERFACE"
+        fi
+    else
+        echo "WireGuard ($WG_INTERFACE) is already down."
+    fi
+}
+
+cmd_status() {
+    local current_ssid
+    current_ssid=$(get_current_ssid)
+    local def_gw_int
+    def_gw_int=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+    
+    echo "=============================================="
+    echo "         WireGuard Auto-VPN Status            "
+    echo "=============================================="
+    echo "Homebrew Prefix     : $BREW_PREFIX"
+    echo "Configured Profile  : $WG_INTERFACE"
+    echo "Trusted SSID(s)     : ${TRUSTED_SSIDS[*]}"
+    echo "Current SSID        : ${current_ssid:-<Not connected to Wi-Fi / Redacted>}"
+    echo "Default Gateway Int : ${def_gw_int:-<None>}"
+    
+    if is_wg_active; then
+        echo "WireGuard Interface : UP (active)"
+    else
+        echo "WireGuard Interface : DOWN (inactive)"
+    fi
+
+    if [[ -f "$TEMP_DISABLE_FLAG" ]]; then
+        echo "Auto-Connect Mode   : PAUSED (temporary: $TEMP_DISABLE_FLAG)"
+    elif [[ -f "$PERSIST_DISABLE_FLAG" ]]; then
+        echo "Auto-Connect Mode   : DISABLED (persistent: $PERSIST_DISABLE_FLAG)"
+    else
+        echo "Auto-Connect Mode   : ENABLED (automatic)"
+    fi
+    echo "=============================================="
+}
+
+cmd_help() {
+    cat <<EOF
+Usage: wireguard-auto [command]
+
+Commands:
+  check     Evaluate network and activate/deactivate WireGuard (called by launchd)
+  status    Show current Wi-Fi network, WireGuard state, and auto-connect mode
+  pause     Temporarily disable auto-connect and bring down WireGuard (ideal for captive portals)
+  resume    Re-enable auto-connect and evaluate current network
+  disable   Persistently disable auto-connect across reboots
+  enable    Same as resume
+  help      Display this help message
+
+Configuration file: $CONFIG_FILE
+EOF
+}
+
+case "${1:-check}" in
+    check)
+        cmd_check
+        ;;
+    status)
+        cmd_status
+        ;;
+    pause)
+        cmd_pause
+        ;;
+    resume|enable)
+        cmd_resume
+        ;;
+    disable)
+        cmd_disable
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        cmd_help
+        exit 1
+        ;;
+esac
