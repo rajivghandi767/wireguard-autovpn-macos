@@ -7,15 +7,22 @@ on:
     branches: [main]
 
 jobs:
-  lint-and-test:
-    name: ShellCheck & Unit Tests (macOS)
-    runs-on: macos-latest
+  shellcheck:
+    name: ShellCheck Static Analysis
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run ShellCheck static analysis
+      - name: Run ShellCheck
         run: shellcheck bin/wireguard-auto install.sh uninstall.sh tests/test_wireguard_auto.sh
+
+  macos-tests:
+    name: Security & Unit Tests (macOS Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Execute Security & Unit Test Suite
         run: ./tests/test_wireguard_auto.sh
