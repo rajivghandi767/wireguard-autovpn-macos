@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: ShellCheck & Unit Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck static analysis
+        run: shellcheck bin/wireguard-auto install.sh uninstall.sh tests/test_wireguard_auto.sh
+
+      - name: Execute Security & Unit Test Suite
+        run: ./tests/test_wireguard_auto.sh
