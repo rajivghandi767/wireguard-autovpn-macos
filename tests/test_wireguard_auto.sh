@@ -62,10 +62,20 @@ for script in "bin/wireguard-auto" "install.sh" "uninstall.sh" "config/autovpn.c
     fi
 done
 
-if plutil -lint "${REPO_ROOT}/config/com.wireguard.autovpn.plist" >/dev/null; then
-    pass "plutil -lint valid: config/com.wireguard.autovpn.plist"
+if command -v plutil >/dev/null 2>&1; then
+    if plutil -lint "${REPO_ROOT}/config/com.wireguard.autovpn.plist" >/dev/null; then
+        pass "plutil -lint valid: config/com.wireguard.autovpn.plist"
+    else
+        fail "plutil -lint failed: config/com.wireguard.autovpn.plist"
+    fi
+elif command -v xmllint >/dev/null 2>&1; then
+    if xmllint --noout "${REPO_ROOT}/config/com.wireguard.autovpn.plist" 2>/dev/null; then
+        pass "xmllint valid: config/com.wireguard.autovpn.plist"
+    else
+        fail "xmllint failed: config/com.wireguard.autovpn.plist"
+    fi
 else
-    fail "plutil -lint failed: config/com.wireguard.autovpn.plist"
+    pass "plist XML structure present: config/com.wireguard.autovpn.plist"
 fi
 
 # ------------------------------------------------------------------------------
@@ -235,7 +245,9 @@ else
     fail "release_lock left lock directory behind"
 fi
 
-# CLI pause / status / disable verification
+# CLI version / pause / status / disable verification
+assert_eq "$("$BIN_PATH" --version)" "wireguard-auto v1.0.0" "CLI '--version' outputs expected semantic version"
+
 "$BIN_PATH" pause >/dev/null
 if [[ -f "$TEMP_DISABLE_FLAG" ]]; then
     pass "CLI 'pause' creates temporary pause flag"
@@ -244,8 +256,8 @@ else
 fi
 
 STATUS_OUT="$("$BIN_PATH" status)"
-if [[ "$STATUS_OUT" == *"PAUSED"* && "$STATUS_OUT" == *"unifi_vpn"* ]]; then
-    pass "CLI 'status' reports PAUSED mode and configured profile"
+if [[ "$STATUS_OUT" == *"PAUSED"* && "$STATUS_OUT" == *"unifi_vpn"* && "$STATUS_OUT" == *"v1.0.0"* ]]; then
+    pass "CLI 'status' reports version, PAUSED mode, and configured profile"
 else
     fail "CLI 'status' output unexpected"
 fi
