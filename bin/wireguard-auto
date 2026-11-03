@@ -175,7 +175,7 @@ _extract_array_items() {
 # Normalize MAC addresses (e.g. BSD arp "0:1a:2b:c:d:e" -> "00:1a:2b:0c:0d:0e")
 normalize_mac() {
     local raw="${1:-}"
-    raw="${raw//-/':'}"
+    raw="${raw//-/:}"
     if [[ ! "$raw" =~ ^([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2})$ ]]; then
         return 1
     fi
