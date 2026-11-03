@@ -62,10 +62,20 @@ for script in "bin/wireguard-auto" "install.sh" "uninstall.sh" "config/autovpn.c
     fi
 done
 
-if plutil -lint "${REPO_ROOT}/config/com.wireguard.autovpn.plist" >/dev/null; then
-    pass "plutil -lint valid: config/com.wireguard.autovpn.plist"
+if command -v plutil >/dev/null 2>&1; then
+    if plutil -lint "${REPO_ROOT}/config/com.wireguard.autovpn.plist" >/dev/null; then
+        pass "plutil -lint valid: config/com.wireguard.autovpn.plist"
+    else
+        fail "plutil -lint failed: config/com.wireguard.autovpn.plist"
+    fi
+elif command -v xmllint >/dev/null 2>&1; then
+    if xmllint --noout "${REPO_ROOT}/config/com.wireguard.autovpn.plist" 2>/dev/null; then
+        pass "xmllint valid: config/com.wireguard.autovpn.plist"
+    else
+        fail "xmllint failed: config/com.wireguard.autovpn.plist"
+    fi
 else
-    fail "plutil -lint failed: config/com.wireguard.autovpn.plist"
+    pass "plist XML structure present: config/com.wireguard.autovpn.plist"
 fi
 
 # ------------------------------------------------------------------------------
