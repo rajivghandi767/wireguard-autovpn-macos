@@ -6,68 +6,205 @@
 set -o pipefail
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Ensure Bash 4+ is running
+# Ensure Bash 4+ is running (macOS ships legacy Bash 3.2 in /bin/bash)
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
     for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
         if [[ -x "$candidate" ]]; then
             exec "$candidate" "$0" "$@"
         fi
     done
-    echo "Error: Bash 4+ is required (install via 'brew install bash')." >&2
+    printf 'Error: Bash 4+ is required (install via "brew install bash").\n' >&2
     exit 1
 fi
 
-# Dynamically detect Homebrew prefix (Apple Silicon vs Intel)
-if [[ -d "/opt/homebrew/etc/wireguard" || -x "/opt/homebrew/bin/wg-quick" ]]; then
-    BREW_PREFIX="/opt/homebrew"
-else
-    BREW_PREFIX="/usr/local"
+# Dynamically detect Homebrew prefix (Apple Silicon vs Intel) unless overridden
+if [[ -z "${BREW_PREFIX:-}" ]]; then
+    if [[ -x "/opt/homebrew/bin/wg-quick" || -x "/opt/homebrew/bin/brew" || -d "/opt/homebrew/etc/wireguard" ]]; then
+        BREW_PREFIX="/opt/homebrew"
+    else
+        BREW_PREFIX="/usr/local"
+    fi
 fi
 
-WG_DIR="${BREW_PREFIX}/etc/wireguard"
-CONFIG_FILE="${WG_DIR}/autovpn.conf"
-WG_BIN="${BREW_PREFIX}/bin/wg"
-WG_QUICK_BIN="${BREW_PREFIX}/bin/wg-quick"
+WG_DIR="${WG_DIR:-${BREW_PREFIX}/etc/wireguard}"
+CONFIG_FILE="${CONFIG_FILE:-${WG_DIR}/autovpn.conf}"
+WG_QUICK_BIN="${WG_QUICK_BIN:-${BREW_PREFIX}/bin/wg-quick}"
 
-LOG_FILE="/var/log/wireguard-auto.log"
-LOCK_DIR="/tmp/wireguard-auto.lock"
-TEMP_DISABLE_FLAG="/tmp/wireguard-auto.disabled"
-PERSIST_DISABLE_FLAG="${WG_DIR}/.disabled"
+RUN_DIR="${RUN_DIR:-/var/run}"
+LOG_FILE="${LOG_FILE:-/var/log/wireguard-auto.log}"
+LOCK_DIR="${LOCK_DIR:-${RUN_DIR}/wireguard-auto.lock}"
+TEMP_DISABLE_FLAG="${TEMP_DISABLE_FLAG:-${RUN_DIR}/wireguard-auto.paused}"
+PERSIST_DISABLE_FLAG="${PERSIST_DISABLE_FLAG:-${WG_DIR}/.disabled}"
 
-# Load user configuration
-if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-else
-    echo "Error: Configuration file not found at $CONFIG_FILE" >&2
-    exit 1
-fi
-
-WG_INTERFACE="${WG_INTERFACE:-homevpn}"
-TRUSTED_SSIDS=("${TRUSTED_SSIDS[@]}")
-TRUSTED_GATEWAY_MACS=("${TRUSTED_GATEWAY_MACS[@]}")
+WG_INTERFACE="homevpn"
+TRUSTED_SSIDS=()
+TRUSTED_GATEWAY_MACS=()
+SSID_REDACTED=0
 
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
-    echo "$msg"
+    local msg
+    msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    printf '%s\n' "$msg"
     if [[ -w "$LOG_FILE" || ( ! -e "$LOG_FILE" && $EUID -eq 0 ) ]]; then
-        echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+        # Rotate log file if it exceeds 5 MB (5242880 bytes)
+        if [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]]; then
+            local size
+            size=$(stat -f %z "$LOG_FILE" 2>/dev/null || echo 0)
+            if (( size > 5242880 )); then
+                mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+            fi
+        fi
+        if [[ ! -L "$LOG_FILE" ]]; then
+            printf '%s\n' "$msg" >> "$LOG_FILE" 2>/dev/null || true
+            if [[ $EUID -eq 0 ]]; then
+                chmod 640 "$LOG_FILE" 2>/dev/null || true
+            fi
+        fi
     fi
+}
+
+verify_config_security() {
+    local cfg="$1"
+    if [[ ! -f "$cfg" ]]; then
+        printf 'Error: Configuration file not found at %s\n' "$cfg" >&2
+        return 1
+    fi
+    if [[ -L "$cfg" ]]; then
+        printf 'Security Error: Configuration file %s must not be a symlink.\n' "$cfg" >&2
+        return 1
+    fi
+    if [[ $EUID -eq 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        local owner_uid perm_octal perm_num
+        owner_uid=$(stat -f %u "$cfg" 2>/dev/null || echo 999)
+        perm_octal=$(stat -f %Lp "$cfg" 2>/dev/null || echo 777)
+        perm_num=$(( 8#${perm_octal} ))
+        if [[ "$owner_uid" != "0" ]] || (( (perm_num & 8#022) != 0 )); then
+            log "Security Error: $cfg must be owned by root:wheel and not group/world-writable (fix with: sudo chown root:wheel '$cfg' && sudo chmod 644 '$cfg')."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Safe declarative configuration parser (never executes source or eval)
+parse_config() {
+    local cfg="$1"
+    verify_config_security "$cfg" || return 1
+
+    WG_INTERFACE="homevpn"
+    TRUSTED_SSIDS=()
+    TRUSTED_GATEWAY_MACS=()
+
+    local state="top"
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # Skip empty lines and full-line comments
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        if [[ "$state" == "top" ]]; then
+            if [[ "$line" =~ ^WG_INTERFACE[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] || \
+               [[ "$line" =~ ^WG_INTERFACE[[:space:]]*=[[:space:]]*\'([^\']+)\' ]] || \
+               [[ "$line" =~ ^WG_INTERFACE[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+                WG_INTERFACE="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^TRUSTED_SSIDS[[:space:]]*=[[:space:]]*\((.*)$ ]]; then
+                local rest="${BASH_REMATCH[1]}"
+                if [[ "$rest" == *")"* ]]; then
+                    rest="${rest%%\)*}"
+                    _extract_array_items "$rest" "TRUSTED_SSIDS"
+                else
+                    _extract_array_items "$rest" "TRUSTED_SSIDS"
+                    state="ssids"
+                fi
+            elif [[ "$line" =~ ^TRUSTED_GATEWAY_MACS[[:space:]]*=[[:space:]]*\((.*)$ ]]; then
+                local rest="${BASH_REMATCH[1]}"
+                if [[ "$rest" == *")"* ]]; then
+                    rest="${rest%%\)*}"
+                    _extract_array_items "$rest" "TRUSTED_GATEWAY_MACS"
+                else
+                    _extract_array_items "$rest" "TRUSTED_GATEWAY_MACS"
+                    state="macs"
+                fi
+            fi
+        elif [[ "$state" == "ssids" ]]; then
+            if [[ "$line" == *")"* ]]; then
+                local before="${line%%\)*}"
+                _extract_array_items "$before" "TRUSTED_SSIDS"
+                state="top"
+            else
+                _extract_array_items "$line" "TRUSTED_SSIDS"
+            fi
+        elif [[ "$state" == "macs" ]]; then
+            if [[ "$line" == *")"* ]]; then
+                local before="${line%%\)*}"
+                _extract_array_items "$before" "TRUSTED_GATEWAY_MACS"
+                state="top"
+            else
+                _extract_array_items "$line" "TRUSTED_GATEWAY_MACS"
+            fi
+        fi
+    done < "$cfg"
+
+    if [[ ! "$WG_INTERFACE" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
+        printf 'Security Error: Invalid WG_INTERFACE "%s" (must be 1-15 alphanumeric, dash, or underscore characters).\n' "$WG_INTERFACE" >&2
+        return 1
+    fi
+    return 0
+}
+
+_extract_array_items() {
+    local input="$1"
+    local target_array="$2"
+
+    # Strip trailing inline comments outside quotes if line starts with #
+    [[ "$input" == \#* ]] && return 0
+
+    local remaining="$input"
+    while [[ "$remaining" =~ \"([^\"]+)\" ]]; do
+        local val="${BASH_REMATCH[1]}"
+        if [[ "$target_array" == "TRUSTED_SSIDS" ]]; then
+            TRUSTED_SSIDS+=("$val")
+        else
+            TRUSTED_GATEWAY_MACS+=("$val")
+        fi
+        remaining="${remaining#*\"${val}\"}"
+    done
+}
+
+# Normalize MAC addresses (e.g. BSD arp "0:1a:2b:c:d:e" -> "00:1a:2b:0c:0d:0e")
+normalize_mac() {
+    local raw="${1:-}"
+    raw="${raw//-/':'}"
+    if [[ ! "$raw" =~ ^([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2}):([0-9a-fA-F]{1,2})$ ]]; then
+        return 1
+    fi
+    printf '%02x:%02x:%02x:%02x:%02x:%02x\n' \
+        "$((16#${BASH_REMATCH[1]}))" \
+        "$((16#${BASH_REMATCH[2]}))" \
+        "$((16#${BASH_REMATCH[3]}))" \
+        "$((16#${BASH_REMATCH[4]}))" \
+        "$((16#${BASH_REMATCH[5]}))" \
+        "$((16#${BASH_REMATCH[6]}))"
 }
 
 acquire_lock() {
     local attempts=5
     while (( attempts > 0 )); do
         if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
             return 0
         fi
-        local mtime
+        local mtime now
         mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0)
-        local now
         now=$(date +%s)
         if (( now - mtime > 45 )); then
-            rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null
+            rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
+            rmdir "$LOCK_DIR" 2>/dev/null || true
             if mkdir "$LOCK_DIR" 2>/dev/null; then
+                printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || true
                 return 0
             fi
         fi
@@ -78,6 +215,7 @@ acquire_lock() {
 }
 
 release_lock() {
+    rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
     rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
@@ -86,12 +224,14 @@ is_wg_active() {
     if [[ -f "$name_file" ]]; then
         local iface
         iface=$(head -n 1 "$name_file" 2>/dev/null)
-        if [[ -n "$iface" ]] && ifconfig "$iface" &>/dev/null; then
-            return 0
-        fi
-        # Clean up stale state if interface no longer exists in kernel
-        if [[ $EUID -eq 0 ]]; then
-            rm -f "$name_file" "/var/run/wireguard/${iface}.sock" 2>/dev/null || true
+        if [[ "$iface" =~ ^utun[0-9]+$ ]]; then
+            if ifconfig "$iface" &>/dev/null; then
+                return 0
+            fi
+            # Clean up stale state if interface no longer exists in kernel
+            if [[ $EUID -eq 0 ]]; then
+                rm -f "$name_file" "/var/run/wireguard/${iface}.sock" 2>/dev/null || true
+            fi
         fi
     fi
 
@@ -99,8 +239,8 @@ is_wg_active() {
     local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
     if [[ -f "$conf_path" ]]; then
         local ip
-        ip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$conf_path" 2>/dev/null)
-        if [[ -n "$ip" ]] && ifconfig 2>/dev/null | grep -q "inet $ip "; then
+        ip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$conf_path" 2>/dev/null | head -n 1)
+        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ifconfig 2>/dev/null | grep -q "inet $ip "; then
             return 0
         fi
     fi
@@ -110,7 +250,14 @@ is_wg_active() {
 get_endpoint_host() {
     local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
     if [[ -f "$conf_path" ]]; then
-        sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*\([^:]*\):.*/\1/p' "$conf_path" 2>/dev/null
+        # Handle IPv6 [addr]:port or IPv4/hostname host:port
+        local raw_ep
+        raw_ep=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$conf_path" 2>/dev/null | head -n 1)
+        if [[ "$raw_ep" =~ ^\[([^\]]+)\]:[0-9]+$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        elif [[ "$raw_ep" =~ ^([^:]+):[0-9]+$ ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+        fi
     fi
 }
 
@@ -119,33 +266,64 @@ get_wifi_device() {
 }
 
 get_current_ssid() {
+    SSID_REDACTED=0
     local wifi_dev
     wifi_dev=$(get_wifi_device)
     wifi_dev="${wifi_dev:-en0}"
 
     local output
     output=$(/usr/sbin/networksetup -getairportnetwork "$wifi_dev" 2>/dev/null | sed -E 's/^Current Wi-Fi Network: //')
-    if [[ "$output" == *"You are not associated"* || "$output" == *"<redacted>"* || -z "$output" ]]; then
+    if [[ "$output" == *"<redacted>"* ]]; then
+        SSID_REDACTED=1
+        output=""
+    elif [[ "$output" == *"You are not associated"* || -z "$output" ]]; then
+        output=""
+    fi
+
+    if [[ -z "$output" ]]; then
         # Fallback for macOS Sonoma / Sequoia / Tahoe via ipconfig summary
-        output=$(/usr/sbin/ipconfig getsummary "$wifi_dev" 2>/dev/null | awk -F ' SSID : ' '/ SSID : / {print $2}' | head -n 1)
-        if [[ "$output" == *"<redacted>"* ]]; then
+        local ipcfg_ssid
+        ipcfg_ssid=$(/usr/sbin/ipconfig getsummary "$wifi_dev" 2>/dev/null | awk -F ' SSID : ' '/ SSID : / {print $2}' | head -n 1)
+        if [[ "$ipcfg_ssid" == *"<redacted>"* ]]; then
+            SSID_REDACTED=1
             output=""
+        elif [[ -n "$ipcfg_ssid" ]]; then
+            SSID_REDACTED=0
+            output="$ipcfg_ssid"
         fi
     fi
-    echo "$output"
+    printf '%s\n' "$output"
 }
 
 get_gateway_mac() {
-    local gw_ip
-    gw_ip=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/ {print $2}')
-    if [[ -n "$gw_ip" ]]; then
-        /usr/sbin/arp -n "$gw_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}$/) print tolower($i)}' | head -n 1
+    local wifi_dev gw_ip
+    wifi_dev=$(get_wifi_device)
+    wifi_dev="${wifi_dev:-en0}"
+
+    # Prefer physical Wi-Fi DHCP router IP so full-tunnel VPNs (NordVPN) do not mask the LAN gateway
+    gw_ip=$(/usr/sbin/ipconfig getoption "$wifi_dev" router 2>/dev/null | head -n 1)
+    if [[ -z "$gw_ip" ]]; then
+        gw_ip=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/ {print $2}' | head -n 1)
+    fi
+
+    if [[ -n "$gw_ip" && "$gw_ip" =~ ^[0-9a-fA-F.:]+$ ]]; then
+        local raw_mac
+        raw_mac=$(/usr/sbin/arp -n "$gw_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}$/) {print $i; exit}}')
+        if [[ -z "$raw_mac" ]]; then
+            # Warm the kernel ARP cache with a single 1-second timeout ping (-t 1 on BSD/macOS)
+            /sbin/ping -c 1 -t 1 "$gw_ip" >/dev/null 2>&1 || true
+            raw_mac=$(/usr/sbin/arp -n "$gw_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^([0-9a-fA-F]{1,2}:){5}[0-9a-fA-F]{1,2}$/) {print $i; exit}}')
+        fi
+        if [[ -n "$raw_mac" ]]; then
+            normalize_mac "$raw_mac" 2>/dev/null || true
+        fi
     fi
 }
 
 is_trusted_network() {
     local current_ssid="$1"
     if [[ -n "$current_ssid" ]]; then
+        local trusted
         for trusted in "${TRUSTED_SSIDS[@]}"; do
             if [[ "$current_ssid" == "$trusted" ]]; then
                 return 0
@@ -157,9 +335,13 @@ is_trusted_network() {
         local gw_mac
         gw_mac=$(get_gateway_mac)
         if [[ -n "$gw_mac" ]]; then
+            local trusted_mac norm_trusted
             for trusted_mac in "${TRUSTED_GATEWAY_MACS[@]}"; do
-                if [[ -n "$trusted_mac" && "$gw_mac" == "$(echo "$trusted_mac" | tr '[:upper:]' '[:lower:]')" ]]; then
-                    return 0
+                if [[ -n "$trusted_mac" ]]; then
+                    norm_trusted=$(normalize_mac "$trusted_mac" 2>/dev/null || true)
+                    if [[ -n "$norm_trusted" && "$gw_mac" == "$norm_trusted" ]]; then
+                        return 0
+                    fi
                 fi
             done
         fi
@@ -185,8 +367,14 @@ wait_for_network_readiness() {
             if [[ -z "$endpoint_host" ]]; then
                 return 0
             fi
-            if dscacheutil -q host -a name "$endpoint_host" 2>/dev/null | grep -q "ip_address:"; then
+            # If Endpoint is already an IPv4 or IPv6 literal, skip DNS lookup
+            if [[ "$endpoint_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$endpoint_host" == *:* ]]; then
                 return 0
+            fi
+            if [[ "$endpoint_host" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+                if dscacheutil -q host -a name "$endpoint_host" 2>/dev/null | grep -q "ip_address:"; then
+                    return 0
+                fi
             fi
         fi
         sleep 1
@@ -202,8 +390,10 @@ cmd_check() {
     fi
     trap release_lock EXIT
 
-    # Allow network / DHCP / VPN handshakes to settle
-    sleep 2
+    if [[ "${SKIP_CHECK_SLEEP:-0}" != "1" ]]; then
+        # Allow network / DHCP / VPN handshakes to settle
+        sleep 2
+    fi
 
     local current_ssid
     current_ssid=$(get_current_ssid)
@@ -217,6 +407,14 @@ cmd_check() {
         exit 0
     fi
 
+    if [[ "${#TRUSTED_SSIDS[@]}" -eq 0 && "${#TRUSTED_GATEWAY_MACS[@]}" -eq 0 ]]; then
+        log "Warning: No TRUSTED_SSIDS or TRUSTED_GATEWAY_MACS configured in $CONFIG_FILE."
+    fi
+
+    if (( SSID_REDACTED == 1 )) && [[ "${#TRUSTED_GATEWAY_MACS[@]}" -eq 0 ]]; then
+        log "Warning: macOS redacted the Wi-Fi SSID (<redacted>) and no TRUSTED_GATEWAY_MACS are configured in $CONFIG_FILE. Configure TRUSTED_GATEWAY_MACS for macOS Sonoma/Sequoia/Tahoe support."
+    fi
+
     if is_trusted_network "$current_ssid"; then
         log "Connected to trusted home network: '${current_ssid:-Gateway MAC Match}'."
         if is_wg_active; then
@@ -228,8 +426,16 @@ cmd_check() {
         exit 0
     fi
 
+    local net_desc="$current_ssid"
+    if [[ -z "$net_desc" ]]; then
+        if (( SSID_REDACTED == 1 )); then
+            net_desc="Redacted Wi-Fi SSID"
+        else
+            net_desc="Non-WiFi / Cellular / Ethernet"
+        fi
+    fi
+
     if is_wg_active; then
-        local net_desc="${current_ssid:-Non-WiFi / Cellular / Ethernet}"
         log "Away from home network ($net_desc). WireGuard ($WG_INTERFACE) is already active."
         exit 0
     fi
@@ -243,49 +449,54 @@ cmd_check() {
         exit 0
     fi
 
-    local net_desc="${current_ssid:-Non-WiFi / Cellular / Ethernet}"
     log "Away from home network ($net_desc). Bringing up WireGuard ($WG_INTERFACE)..."
     "$WG_QUICK_BIN" up "$WG_INTERFACE"
 }
 
 cmd_pause() {
-    touch "$TEMP_DISABLE_FLAG"
-    echo "WireGuard auto-connect paused (temporary flag created at $TEMP_DISABLE_FLAG)."
-    if is_wg_active; then
-        if [[ $EUID -ne 0 ]]; then
-            echo "Elevating privileges to bring down $WG_INTERFACE..."
-            exec sudo "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        else
-            "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        fi
-    else
-        echo "WireGuard ($WG_INTERFACE) is already down."
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        printf 'Elevating privileges to pause WireGuard auto-connect...\n'
+        exec sudo "$0" pause
     fi
-    echo "Run 'wireguard-auto resume' to re-enable auto-connect."
+    if [[ -L "$TEMP_DISABLE_FLAG" ]]; then
+        rm -f "$TEMP_DISABLE_FLAG"
+    fi
+    touch "$TEMP_DISABLE_FLAG"
+    chmod 644 "$TEMP_DISABLE_FLAG" 2>/dev/null || true
+    printf 'WireGuard auto-connect paused (temporary flag created at %s).\n' "$TEMP_DISABLE_FLAG"
+    if is_wg_active; then
+        "$WG_QUICK_BIN" down "$WG_INTERFACE"
+    else
+        printf 'WireGuard (%s) is already down.\n' "$WG_INTERFACE"
+    fi
+    printf "Run 'wireguard-auto resume' to re-enable auto-connect.\n"
 }
 
 cmd_resume() {
-    rm -f "$TEMP_DISABLE_FLAG" "$PERSIST_DISABLE_FLAG"
-    echo "WireGuard auto-connect resumed. Triggering network check..."
-    if [[ $EUID -ne 0 ]]; then
-        exec sudo "$0" check
-    else
-        cmd_check
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        printf 'Elevating privileges to resume WireGuard auto-connect...\n'
+        exec sudo "$0" resume
     fi
+    rm -f "$TEMP_DISABLE_FLAG" "$PERSIST_DISABLE_FLAG"
+    printf 'WireGuard auto-connect resumed. Triggering network check...\n'
+    cmd_check
 }
 
 cmd_disable() {
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        printf 'Elevating privileges to disable WireGuard auto-connect...\n'
+        exec sudo "$0" disable
+    fi
+    if [[ -L "$PERSIST_DISABLE_FLAG" ]]; then
+        rm -f "$PERSIST_DISABLE_FLAG"
+    fi
     touch "$PERSIST_DISABLE_FLAG"
-    echo "WireGuard auto-connect persistently disabled (flag created at $PERSIST_DISABLE_FLAG)."
+    chmod 644 "$PERSIST_DISABLE_FLAG" 2>/dev/null || true
+    printf 'WireGuard auto-connect persistently disabled (flag created at %s).\n' "$PERSIST_DISABLE_FLAG"
     if is_wg_active; then
-        if [[ $EUID -ne 0 ]]; then
-            echo "Elevating privileges to bring down $WG_INTERFACE..."
-            exec sudo "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        else
-            "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        fi
+        "$WG_QUICK_BIN" down "$WG_INTERFACE"
     else
-        echo "WireGuard ($WG_INTERFACE) is already down."
+        printf 'WireGuard (%s) is already down.\n' "$WG_INTERFACE"
     fi
 }
 
@@ -293,31 +504,44 @@ cmd_status() {
     local current_ssid
     current_ssid=$(get_current_ssid)
     local def_gw_int
-    def_gw_int=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
-    
-    echo "=============================================="
-    echo "         WireGuard Auto-VPN Status            "
-    echo "=============================================="
-    echo "Homebrew Prefix     : $BREW_PREFIX"
-    echo "Configured Profile  : $WG_INTERFACE"
-    echo "Trusted SSID(s)     : ${TRUSTED_SSIDS[*]}"
-    echo "Current SSID        : ${current_ssid:-<Not connected to Wi-Fi / Redacted>}"
-    echo "Default Gateway Int : ${def_gw_int:-<None>}"
-    
-    if is_wg_active; then
-        echo "WireGuard Interface : UP (active)"
+    def_gw_int=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}' | head -n 1)
+    local gw_mac
+    gw_mac=$(get_gateway_mac)
+
+    local ssid_display
+    if [[ -n "$current_ssid" ]]; then
+        ssid_display="$current_ssid"
+    elif (( SSID_REDACTED == 1 )); then
+        ssid_display="<Redacted by macOS Privacy — use TRUSTED_GATEWAY_MACS>"
     else
-        echo "WireGuard Interface : DOWN (inactive)"
+        ssid_display="<Not connected to Wi-Fi>"
+    fi
+
+    printf '==============================================\n'
+    printf '         WireGuard Auto-VPN Status            \n'
+    printf '==============================================\n'
+    printf 'Homebrew Prefix     : %s\n' "$BREW_PREFIX"
+    printf 'Configured Profile  : %s\n' "$WG_INTERFACE"
+    printf 'Trusted SSID(s)     : %s\n' "${TRUSTED_SSIDS[*]:-<None>}"
+    printf 'Trusted Gateway MACs: %s\n' "${TRUSTED_GATEWAY_MACS[*]:-<None>}"
+    printf 'Current SSID        : %s\n' "$ssid_display"
+    printf 'Current Gateway MAC : %s\n' "${gw_mac:-<None>}"
+    printf 'Default Gateway Int : %s\n' "${def_gw_int:-<None>}"
+
+    if is_wg_active; then
+        printf 'WireGuard Interface : UP (active)\n'
+    else
+        printf 'WireGuard Interface : DOWN (inactive)\n'
     fi
 
     if [[ -f "$TEMP_DISABLE_FLAG" ]]; then
-        echo "Auto-Connect Mode   : PAUSED (temporary: $TEMP_DISABLE_FLAG)"
+        printf 'Auto-Connect Mode   : PAUSED (temporary: %s)\n' "$TEMP_DISABLE_FLAG"
     elif [[ -f "$PERSIST_DISABLE_FLAG" ]]; then
-        echo "Auto-Connect Mode   : DISABLED (persistent: $PERSIST_DISABLE_FLAG)"
+        printf 'Auto-Connect Mode   : DISABLED (persistent: %s)\n' "$PERSIST_DISABLE_FLAG"
     else
-        echo "Auto-Connect Mode   : ENABLED (automatic)"
+        printf 'Auto-Connect Mode   : ENABLED (automatic)\n'
     fi
-    echo "=============================================="
+    printf '==============================================\n'
 }
 
 cmd_help() {
@@ -326,8 +550,8 @@ Usage: wireguard-auto [command]
 
 Commands:
   check     Evaluate network and activate/deactivate WireGuard (called by launchd)
-  status    Show current Wi-Fi network, WireGuard state, and auto-connect mode
-  pause     Temporarily disable auto-connect and bring down WireGuard (ideal for captive portals)
+  status    Show current Wi-Fi network, gateway MAC, WireGuard state, and mode
+  pause     Temporarily disable auto-connect and bring down WireGuard (captive portals)
   resume    Re-enable auto-connect and evaluate current network
   disable   Persistently disable auto-connect across reboots
   enable    Same as resume
@@ -336,6 +560,23 @@ Commands:
 Configuration file: $CONFIG_FILE
 EOF
 }
+
+# Allow unit tests to source helper functions without executing the CLI entrypoint
+if [[ "${WIREGUARD_AUTO_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+case "${1:-check}" in
+    help|--help|-h)
+        cmd_help
+        exit 0
+        ;;
+esac
+
+# Load and validate user configuration
+if ! parse_config "$CONFIG_FILE"; then
+    exit 1
+fi
 
 case "${1:-check}" in
     check)
@@ -353,11 +594,8 @@ case "${1:-check}" in
     disable)
         cmd_disable
         ;;
-    help|--help|-h)
-        cmd_help
-        ;;
     *)
-        echo "Unknown command: $1" >&2
+        printf 'Unknown command: %s\n' "$1" >&2
         cmd_help
         exit 1
         ;;

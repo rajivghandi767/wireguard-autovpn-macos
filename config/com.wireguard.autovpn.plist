@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__BREW_PREFIX__/bin/wireguard-auto</string>
+        <string>/Library/Application Support/wireguard-auto/bin/wireguard-auto</string>
         <string>check</string>
     </array>
 
