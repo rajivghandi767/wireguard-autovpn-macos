@@ -110,14 +110,26 @@ PersistentKeepalive = 25
 
 ## 🚀 Installation & Configuration
 
-1. **Clone the repository and run the installer:**
-   ```bash
-   git clone https://github.com/rajivghandi767/wireguard-autovpn-macos.git
-   cd wireguard-autovpn-macos
-   sudo ./install.sh
-   ```
+### Option 1: Install via Homebrew Tap (Recommended)
+Installing via the custom Homebrew Tap automatically pulls in `bash` and `wireguard-tools` and verifies the release tarball's SHA-256 checksum:
 
-2. **Inspect your current network & Gateway MAC (while connected to home Wi-Fi):**
+```bash
+brew install rajivghandi767/tap/wireguard-autovpn-macos
+sudo wireguard-auto install-daemon
+```
+
+### Option 2: Install from Source
+```bash
+git clone https://github.com/rajivghandi767/wireguard-autovpn-macos.git
+cd wireguard-autovpn-macos
+sudo ./install.sh
+```
+
+---
+
+### Post-Install Configuration
+
+1. **Inspect your current network & Gateway MAC (while connected to home Wi-Fi):**
    ```bash
    wireguard-auto status
    ```
@@ -126,6 +138,7 @@ PersistentKeepalive = 25
    ==============================================
             WireGuard Auto-VPN Status            
    ==============================================
+   Version             : v1.0.0
    Homebrew Prefix     : /opt/homebrew
    Configured Profile  : homevpn
    Trusted SSID(s)     : Your-Home-WiFi-SSID
@@ -138,7 +151,7 @@ PersistentKeepalive = 25
    ==============================================
    ```
 
-3. **Configure your trusted home network in `<BREW_PREFIX>/etc/wireguard/autovpn.conf`:**
+2. **Configure your trusted home network in `<BREW_PREFIX>/etc/wireguard/autovpn.conf`:**
    ```bash
    sudo nano "$(brew --prefix)/etc/wireguard/autovpn.conf"
    ```
@@ -157,7 +170,7 @@ PersistentKeepalive = 25
    )
    ```
 
-4. **Trigger an immediate evaluation:**
+3. **Trigger an immediate evaluation:**
    ```bash
    sudo wireguard-auto check
    ```
@@ -167,16 +180,20 @@ PersistentKeepalive = 25
 ## 💻 CLI Usage
 
 ```text
+wireguard-auto v1.0.0
 Usage: wireguard-auto [command]
 
 Commands:
-  check     Evaluate network and activate/deactivate WireGuard (called by launchd)
-  status    Show current Wi-Fi network, gateway MAC, WireGuard state, and mode
-  pause     Temporarily disable auto-connect and bring down WireGuard (captive portals)
-  resume    Re-enable auto-connect and evaluate current network
-  disable   Persistently disable auto-connect across reboots
-  enable    Same as resume
-  help      Display this help message
+  check             Evaluate network and activate/deactivate WireGuard (called by launchd)
+  status            Show current Wi-Fi network, gateway MAC, WireGuard state, and mode
+  pause             Temporarily disable auto-connect and bring down WireGuard (captive portals)
+  resume            Re-enable auto-connect and evaluate current network
+  disable           Persistently disable auto-connect across reboots
+  enable            Same as resume
+  install-daemon    Install/update and load the root LaunchDaemon (requires sudo)
+  uninstall-daemon  Unload and remove the root LaunchDaemon (requires sudo)
+  version           Display version information
+  help              Display this help message
 ```
 
 ### Captive Portal Workflow (Hotels / Flights / Cafes)
@@ -207,10 +224,23 @@ The repository includes a zero-dependency sandboxed test suite (`tests/test_wire
 ./tests/test_wireguard_auto.sh
 ```
 
+### Upgrading
+To update to the latest release while preserving your existing `autovpn.conf` and WireGuard profiles:
+```bash
+# If installed via Homebrew Tap:
+brew update && brew upgrade wireguard-autovpn-macos
+sudo wireguard-auto install-daemon
+
+# If installed from source:
+git pull origin main && sudo ./install.sh
+```
+
 ### Uninstallation
 To cleanly unload the `launchd` daemon and remove the binary and CLI symlink while preserving your WireGuard `.conf` files:
 ```bash
-sudo ./uninstall.sh
+sudo wireguard-auto uninstall-daemon
+# Optional (if installed via Homebrew):
+brew uninstall wireguard-autovpn-macos
 ```
 
 ---
