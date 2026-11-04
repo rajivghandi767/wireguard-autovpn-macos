@@ -18,15 +18,15 @@ While running a self-hosted bare-metal [Homelab](https://github.com/rajivghandi7
 
 At the same time, when working from coffee shops, airports, or hotels, I wanted to keep **NordVPN** active for general web browsing, encrypted public Wi-Fi traffic, and geo-location switching. Existing options fell short:
 
-1. **No SSID On-Demand in the Official macOS App:** Unlike the iOS WireGuard app, the official macOS WireGuard GUI client does not support automatic SSID-based On-Demand toggling unless provisioned via enterprise Apple MDM configuration profiles (`mobileconfig`).
-2. **Dual-VPN Routing Collisions:** Running a full-tunnel commercial VPN alongside a full-tunnel WireGuard client causes default-gateway race conditions. By combining `wireguard-go` split-tunneling (`AllowedIPs` scoped strictly to internal homelab subnets) with an automated route/DNS readiness preflight loop, **both VPNs run simultaneously**—NordVPN encrypts all public internet traffic (`0.0.0.0/0`) while `wireguard-auto` transparently routes private subnet traffic (`10.100.x.x` / `192.168.x.x`) directly to the UniFi router.
+1. **Official macOS GUI App `NetworkExtension` Limitations:** While the official macOS WireGuard GUI client supports SSID-based On-Demand rules, it operates inside Apple's `NetworkExtension` (`NEPacketTunnelProvider`) subsystem, which takes an all-or-nothing approach to tunnel state and DNS/routing claims—breaking general internet connectivity when run alongside commercial VPNs like NordVPN.
+2. **Daemon-Level `utun` Split-Tunneling (Zero Routing Collisions):** By intervening directly at the `launchd` daemon level using `wg-quick` (`wireguard-tools` + `wireguard-go`) rather than the GUI wrapper, `wireguard-auto` provisions an independent `utun` interface and injects surgical static subnet routes (`AllowedIPs` scoped strictly to internal homelab CIDR blocks) after an automated route/DNS readiness preflight loop. **Both VPNs run simultaneously**—NordVPN encrypts all public internet traffic (`0.0.0.0/0`) while `wireguard-auto` transparently routes private subnet traffic (`10.100.x.x` / `192.168.x.x`) directly to the UniFi router.
 3. **Cross-Architecture Portability (`x86_64` $\rightarrow$ `arm64`):** Built on an Early 2015 Intel MacBook Pro (macOS Monterey) with forward-compatible support for Apple Silicon M-series Macs (macOS Sonoma, Sequoia, and Tahoe), dynamically resolving Homebrew prefixes (`/usr/local` vs. `/opt/homebrew`) and modern macOS Wi-Fi privacy redaction out of the box.
 
 | Capability | Official WireGuard macOS App | Naive Polling Scripts (`while true; sleep 5`) | `wireguard-autovpn-macos` |
 | :--- | :---: | :---: | :---: |
-| **Automatic Trusted Wi-Fi Disconnection** | ❌ (Requires Apple MDM Profile) | ✅ | ✅ |
+| **Automatic Trusted Wi-Fi Disconnection** | ✅ (Built-in On-Demand) | ✅ | ✅ |
 | **Zero Background Polling (Battery Safe)** | ✅ | ❌ (Constant CPU wakeups) | ✅ (`launchd` `WatchPaths`) |
-| **Coexists with Commercial VPNs (NordVPN)** | ⚠️ (Manual split-tunnel timing) | ❌ (Boot/wake race conditions) | ✅ (Route & DNS preflight loop) |
+| **Coexists with Commercial VPNs (NordVPN)** | ❌ (All-or-nothing GUI routing breaks internet) | ❌ (Boot/wake race conditions) | ✅ (Daemon-level `utun` split-tunnel + preflight) |
 | **macOS Sonoma / Sequoia `<redacted>` SSID Support** | ❌ | ❌ | ✅ (Normalized Gateway ARP MAC fallback) |
 | **Captive Portal CLI Override (`pause` / `resume`)** | ❌ | ❌ | ✅ |
 
