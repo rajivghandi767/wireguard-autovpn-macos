@@ -6,7 +6,7 @@
 set -o pipefail
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Prefer Homebrew Bash 4+ if installed, while remaining compatible with macOS /bin/bash 3.2+
 if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -36,15 +36,24 @@ DAEMON_BIN="${DAEMON_DIR}/wireguard-auto"
 PLIST_DEST="${PLIST_DEST:-/Library/LaunchDaemons/com.wireguard.autovpn.plist}"
 
 RUN_DIR="${RUN_DIR:-/var/run}"
+WG_RUN_DIR="${WG_RUN_DIR:-/var/run/wireguard}"
 LOG_FILE="${LOG_FILE:-/var/log/wireguard-auto.log}"
 LOCK_DIR="${LOCK_DIR:-${RUN_DIR}/wireguard-auto.lock}"
 TEMP_DISABLE_FLAG="${TEMP_DISABLE_FLAG:-${RUN_DIR}/wireguard-auto.paused}"
 PERSIST_DISABLE_FLAG="${PERSIST_DISABLE_FLAG:-${WG_DIR}/.disabled}"
+FULL_TUNNEL_FLAG="${FULL_TUNNEL_FLAG:-${RUN_DIR}/wireguard-auto.full}"
+STATE_FILE="${STATE_FILE:-${RUN_DIR}/wireguard-auto.state}"
 
 WG_INTERFACE="homevpn"
+WG_FULL_INTERFACE=""
 TRUSTED_SSIDS=()
 TRUSTED_GATEWAY_MACS=()
 SSID_REDACTED=0
+STATE_PROFILE=""
+STATE_IFACE=""
+STATE_IP=""
+FULL_BOUND_SSID=""
+FULL_BOUND_MAC=""
 
 log() {
     local msg
@@ -97,6 +106,7 @@ parse_config() {
     verify_config_security "$cfg" || return 1
 
     WG_INTERFACE="homevpn"
+    WG_FULL_INTERFACE=""
     TRUSTED_SSIDS=()
     TRUSTED_GATEWAY_MACS=()
 
@@ -115,6 +125,10 @@ parse_config() {
                [[ "$line" =~ ^WG_INTERFACE[[:space:]]*=[[:space:]]*\'([^\']+)\' ]] || \
                [[ "$line" =~ ^WG_INTERFACE[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
                 WG_INTERFACE="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^WG_FULL_INTERFACE[[:space:]]*=[[:space:]]*\"([^\"]+)\" ]] || \
+                 [[ "$line" =~ ^WG_FULL_INTERFACE[[:space:]]*=[[:space:]]*\'([^\']+)\' ]] || \
+                 [[ "$line" =~ ^WG_FULL_INTERFACE[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+                WG_FULL_INTERFACE="${BASH_REMATCH[1]}"
             elif [[ "$line" =~ ^TRUSTED_SSIDS[[:space:]]*=[[:space:]]*\((.*)$ ]]; then
                 local rest="${BASH_REMATCH[1]}"
                 if [[ "$rest" == *")"* ]]; then
@@ -156,6 +170,16 @@ parse_config() {
     if [[ ! "$WG_INTERFACE" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
         printf 'Security Error: Invalid WG_INTERFACE "%s" (must be 1-15 alphanumeric, dash, or underscore characters).\n' "$WG_INTERFACE" >&2
         return 1
+    fi
+    if [[ -n "$WG_FULL_INTERFACE" ]]; then
+        if [[ ! "$WG_FULL_INTERFACE" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
+            printf 'Security Error: Invalid WG_FULL_INTERFACE "%s" (must be 1-15 alphanumeric, dash, or underscore characters).\n' "$WG_FULL_INTERFACE" >&2
+            return 1
+        fi
+        if [[ "$WG_FULL_INTERFACE" == "$WG_INTERFACE" ]]; then
+            printf 'Configuration Error: WG_FULL_INTERFACE ("%s") must differ from WG_INTERFACE.\n' "$WG_FULL_INTERFACE" >&2
+            return 1
+        fi
     fi
     return 0
 }
@@ -224,36 +248,333 @@ release_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
-is_wg_active() {
-    local name_file="/var/run/wireguard/${WG_INTERFACE}.name"
-    if [[ -f "$name_file" ]]; then
+get_full_interface() {
+    local full_iface
+    if [[ -n "$WG_FULL_INTERFACE" ]]; then
+        full_iface="$WG_FULL_INTERFACE"
+    else
+        full_iface="${WG_INTERFACE}-full"
+    fi
+    if [[ ! "$full_iface" =~ ^[a-zA-Z0-9_-]{1,15}$ ]]; then
+        return 1
+    fi
+    if [[ "$full_iface" == "$WG_INTERFACE" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$full_iface"
+}
+
+interface_exists() {
+    local iface="$1"
+    [[ "$iface" =~ ^utun[0-9]+$ ]] && ifconfig "$iface" &>/dev/null
+}
+
+get_iface_ipv4() {
+    local iface="$1"
+    ifconfig "$iface" 2>/dev/null | awk '$1 == "inet" { print $2; exit }'
+}
+
+read_state_file() {
+    STATE_PROFILE=""
+    STATE_IFACE=""
+    STATE_IP=""
+    if [[ ! -f "$STATE_FILE" || -L "$STATE_FILE" || ! -r "$STATE_FILE" ]]; then
+        return 1
+    fi
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^PROFILE=([a-zA-Z0-9_-]{1,15})$ ]]; then
+            STATE_PROFILE="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^IFACE=(utun[0-9]+)$ ]]; then
+            STATE_IFACE="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^IP=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            STATE_IP="${BASH_REMATCH[1]}"
+        fi
+    done < "$STATE_FILE"
+    [[ -n "$STATE_PROFILE" && -n "$STATE_IFACE" ]]
+}
+
+write_state_file() {
+    local profile="$1"
+    local iface="$2"
+    local ip="${3:-}"
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        return 0
+    fi
+    if [[ ! "$profile" =~ ^[a-zA-Z0-9_-]{1,15}$ || ! "$iface" =~ ^utun[0-9]+$ ]]; then
+        return 1
+    fi
+    if [[ -n "$ip" && ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=""
+    fi
+    if [[ -L "$STATE_FILE" ]]; then
+        rm -f "$STATE_FILE" 2>/dev/null || true
+    fi
+    printf 'PROFILE=%s\nIFACE=%s\nIP=%s\n' "$profile" "$iface" "$ip" > "$STATE_FILE" 2>/dev/null || return 1
+    chmod 644 "$STATE_FILE" 2>/dev/null || true
+    return 0
+}
+
+clear_state_file() {
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        return 0
+    fi
+    rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+is_full_mode_enabled() {
+    [[ -f "$FULL_TUNNEL_FLAG" && ! -L "$FULL_TUNNEL_FLAG" ]]
+}
+
+read_full_mode_flag() {
+    FULL_BOUND_SSID=""
+    FULL_BOUND_MAC=""
+    if ! is_full_mode_enabled || [[ ! -r "$FULL_TUNNEL_FLAG" ]]; then
+        return 1
+    fi
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == SSID=* ]]; then
+            FULL_BOUND_SSID="${line#SSID=}"
+        elif [[ "$line" == GATEWAY_MAC=* ]]; then
+            local raw_mac="${line#GATEWAY_MAC=}"
+            if [[ -n "$raw_mac" ]]; then
+                FULL_BOUND_MAC=$(normalize_mac "$raw_mac" 2>/dev/null || true)
+            fi
+        fi
+    done < "$FULL_TUNNEL_FLAG"
+    return 0
+}
+
+write_full_mode_flag() {
+    local bound_ssid="${1:-}"
+    local bound_mac="${2:-}"
+    bound_ssid="${bound_ssid//$'\n'/}"
+    bound_ssid="${bound_ssid//$'\r'/}"
+    if [[ -n "$bound_mac" ]]; then
+        bound_mac=$(normalize_mac "$bound_mac" 2>/dev/null || true)
+    fi
+    if [[ -L "$FULL_TUNNEL_FLAG" ]]; then
+        rm -f "$FULL_TUNNEL_FLAG" 2>/dev/null || true
+    fi
+    printf 'SSID=%s\nGATEWAY_MAC=%s\n' "$bound_ssid" "$bound_mac" > "$FULL_TUNNEL_FLAG"
+    chmod 644 "$FULL_TUNNEL_FLAG" 2>/dev/null || true
+}
+
+clear_full_mode_flag() {
+    rm -f "$FULL_TUNNEL_FLAG" 2>/dev/null || true
+}
+
+is_same_full_tunnel_network() {
+    local current_ssid="${1:-}"
+    local current_mac="${2:-}"
+    if [[ -n "$current_mac" ]]; then
+        current_mac=$(normalize_mac "$current_mac" 2>/dev/null || true)
+    fi
+
+    read_full_mode_flag || return 1
+
+    # Never reset during transient Wi-Fi disconnects / sleep-wake transitions
+    if [[ -z "$current_ssid" && -z "$current_mac" ]]; then
+        return 0
+    fi
+
+    # When both saved and current SSIDs are visible, compare exact SSID strings
+    if [[ -n "$FULL_BOUND_SSID" && -n "$current_ssid" ]]; then
+        [[ "$current_ssid" == "$FULL_BOUND_SSID" ]]
+        return $?
+    fi
+
+    # Fallback to normalized Gateway MAC (handles macOS Sonoma/Sequoia/Tahoe <redacted> SSIDs & Ethernet)
+    if [[ -n "$FULL_BOUND_MAC" && -n "$current_mac" ]]; then
+        [[ "$current_mac" == "$FULL_BOUND_MAC" ]]
+        return $?
+    fi
+
+    return 0
+}
+
+get_profile_utun_from_name_file() {
+    local profile="$1"
+    local name_file="${WG_RUN_DIR}/${profile}.name"
+    if [[ -f "$name_file" && ! -L "$name_file" && -r "$name_file" ]]; then
         local iface
         iface=$(head -n 1 "$name_file" 2>/dev/null)
         if [[ "$iface" =~ ^utun[0-9]+$ ]]; then
-            if ifconfig "$iface" &>/dev/null; then
+            if interface_exists "$iface"; then
+                printf '%s\n' "$iface"
                 return 0
             fi
             # Clean up stale state if interface no longer exists in kernel
             if [[ $EUID -eq 0 ]]; then
-                rm -f "$name_file" "/var/run/wireguard/${iface}.sock" 2>/dev/null || true
+                rm -f "$name_file" "${WG_RUN_DIR}/${iface}.sock" 2>/dev/null || true
             fi
-        fi
-    fi
-
-    # Fallback check: interface IP address active in kernel
-    local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
-    if [[ -f "$conf_path" ]]; then
-        local ip
-        ip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$conf_path" 2>/dev/null | head -n 1)
-        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ifconfig 2>/dev/null | grep -q "inet $ip "; then
-            return 0
         fi
     fi
     return 1
 }
 
+get_profile_utun_from_state_file() {
+    local profile="$1"
+    if read_state_file && [[ "$STATE_PROFILE" == "$profile" ]]; then
+        if interface_exists "$STATE_IFACE"; then
+            if [[ -n "$STATE_IP" ]]; then
+                local live_ip
+                live_ip=$(get_iface_ipv4 "$STATE_IFACE")
+                if [[ "$live_ip" == "$STATE_IP" ]]; then
+                    printf '%s\n' "$STATE_IFACE"
+                    return 0
+                fi
+            else
+                printf '%s\n' "$STATE_IFACE"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+get_profile_utun() {
+    local profile="$1"
+    local iface=""
+
+    # 1. Primary authoritative check: /var/run/wireguard/<profile>.name (readable by root)
+    if iface=$(get_profile_utun_from_name_file "$profile"); then
+        printf '%s\n' "$iface"
+        return 0
+    fi
+
+    # 2. World-readable daemon state file (used when /var/run/wireguard is 0700 root-only for non-root 'status')
+    local name_file="${WG_RUN_DIR}/${profile}.name"
+    if [[ ! -d "$WG_RUN_DIR" || ! -r "$WG_RUN_DIR" || ( -e "$name_file" && ! -r "$name_file" ) ]]; then
+        if iface=$(get_profile_utun_from_state_file "$profile"); then
+            printf '%s\n' "$iface"
+            return 0
+        fi
+    fi
+
+    # 3. IP fallback: only when conf is readable AND no sibling profile owns a live .name or state entry
+    local other_profile=""
+    local full_iface=""
+    full_iface=$(get_full_interface 2>/dev/null || true)
+    if [[ "$profile" == "$WG_INTERFACE" && -n "$full_iface" ]]; then
+        other_profile="$full_iface"
+    elif [[ -n "$full_iface" && "$profile" == "$full_iface" ]]; then
+        other_profile="$WG_INTERFACE"
+    fi
+
+    if [[ -n "$other_profile" ]]; then
+        if get_profile_utun_from_name_file "$other_profile" >/dev/null; then
+            return 1
+        fi
+        local other_name_file="${WG_RUN_DIR}/${other_profile}.name"
+        if [[ ! -d "$WG_RUN_DIR" || ! -r "$WG_RUN_DIR" || ( -e "$other_name_file" && ! -r "$other_name_file" ) ]]; then
+            if get_profile_utun_from_state_file "$other_profile" >/dev/null; then
+                return 1
+            fi
+        fi
+    fi
+
+    local conf_path="${WG_DIR}/${profile}.conf"
+    if [[ -f "$conf_path" && -r "$conf_path" ]]; then
+        local ip
+        ip=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$conf_path" 2>/dev/null | head -n 1)
+        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            iface=$(ifconfig 2>/dev/null | awk -v target="$ip" '
+                /^[a-zA-Z0-9]+:/ { cur=$1; sub(/:$/, "", cur) }
+                $1 == "inet" && $2 == target { print cur; exit }
+            ')
+            if [[ "$iface" =~ ^utun[0-9]+$ ]]; then
+                printf '%s\n' "$iface"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+is_profile_active() {
+    local profile="$1"
+    get_profile_utun "$profile" >/dev/null
+}
+
+sync_state_file() {
+    local profile="$1"
+    local iface=""
+    if iface=$(get_profile_utun_from_name_file "$profile"); then
+        local ip=""
+        ip=$(get_iface_ipv4 "$iface")
+        write_state_file "$profile" "$iface" "$ip"
+    fi
+}
+
+bring_up_profile() {
+    local profile="$1"
+    if "$WG_QUICK_BIN" up "$profile"; then
+        sync_state_file "$profile"
+        return 0
+    fi
+    return 1
+}
+
+bring_down_profile() {
+    local profile="$1"
+    local rc=0
+    "$WG_QUICK_BIN" down "$profile" || rc=$?
+    if read_state_file && [[ "$STATE_PROFILE" == "$profile" ]]; then
+        clear_state_file
+    fi
+    return "$rc"
+}
+
+teardown_active_profiles() {
+    local tore_down=0
+    local full_iface=""
+    full_iface=$(get_full_interface 2>/dev/null || true)
+
+    if [[ -n "$full_iface" ]] && is_profile_active "$full_iface"; then
+        log "Tearing down $full_iface..."
+        bring_down_profile "$full_iface" || true
+        tore_down=1
+    fi
+    if is_profile_active "$WG_INTERFACE"; then
+        log "Tearing down $WG_INTERFACE..."
+        bring_down_profile "$WG_INTERFACE" || true
+        tore_down=1
+    fi
+    clear_state_file
+    return $(( tore_down == 1 ? 0 : 1 ))
+}
+
+verify_profile_conf() {
+    local profile="$1"
+    local conf_path="${WG_DIR}/${profile}.conf"
+    if [[ -L "$conf_path" ]]; then
+        printf 'Security Error: WireGuard profile %s must not be a symlink.\n' "$conf_path" >&2
+        return 1
+    fi
+    if [[ ! -f "$conf_path" ]]; then
+        printf 'Error: WireGuard full-tunnel profile not found at %s\n' "$conf_path" >&2
+        printf 'Create it by copying %s/%s.conf with AllowedIPs = 0.0.0.0/0 (and optional DNS), then secure it:\n' "$WG_DIR" "$WG_INTERFACE" >&2
+        printf '  sudo chown root:wheel "%s" && sudo chmod 600 "%s"\n' "$conf_path" "$conf_path" >&2
+        return 1
+    fi
+    if [[ $EUID -eq 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        local owner_uid perm_octal perm_num
+        owner_uid=$(stat -f %u "$conf_path" 2>/dev/null || echo 999)
+        perm_octal=$(stat -f %Lp "$conf_path" 2>/dev/null || echo 777)
+        perm_num=$(( 8#${perm_octal} ))
+        if [[ "$owner_uid" != "0" ]] || (( (perm_num & 8#077) != 0 )); then
+            log "Security Error: $conf_path must be owned by root:wheel with mode 0600 (fix with: sudo wireguard-auto install-daemon)."
+            return 1
+        fi
+    fi
+    return 0
+}
+
 get_endpoint_host() {
-    local conf_path="${WG_DIR}/${WG_INTERFACE}.conf"
+    local profile="${1:-$WG_INTERFACE}"
+    local conf_path="${WG_DIR}/${profile}.conf"
     if [[ -f "$conf_path" ]]; then
         # Handle IPv6 [addr]:port or IPv4/hostname host:port
         local raw_ep
@@ -264,6 +585,29 @@ get_endpoint_host() {
             printf '%s\n' "${BASH_REMATCH[1]}"
         fi
     fi
+}
+
+get_default_gateway_interface() {
+    /sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}' | head -n 1
+}
+
+get_conflicting_vpn_interface() {
+    local def_int
+    def_int=$(get_default_gateway_interface)
+    if [[ ! "$def_int" =~ ^utun[0-9]+$ ]]; then
+        return 1
+    fi
+    local split_utun="" full_utun="" full_iface=""
+    split_utun=$(get_profile_utun "$WG_INTERFACE" 2>/dev/null || true)
+    full_iface=$(get_full_interface 2>/dev/null || true)
+    if [[ -n "$full_iface" ]]; then
+        full_utun=$(get_profile_utun "$full_iface" 2>/dev/null || true)
+    fi
+    if [[ "$def_int" == "$split_utun" || "$def_int" == "$full_utun" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$def_int"
+    return 0
 }
 
 get_wifi_device() {
@@ -327,6 +671,7 @@ get_gateway_mac() {
 
 is_trusted_network() {
     local current_ssid="$1"
+    local gw_mac="${2:-}"
     if [[ -n "$current_ssid" && "${#TRUSTED_SSIDS[@]}" -gt 0 ]]; then
         local trusted
         for trusted in "${TRUSTED_SSIDS[@]}"; do
@@ -337,8 +682,9 @@ is_trusted_network() {
     fi
 
     if [[ "${#TRUSTED_GATEWAY_MACS[@]}" -gt 0 ]]; then
-        local gw_mac
-        gw_mac=$(get_gateway_mac)
+        if [[ -z "$gw_mac" ]]; then
+            gw_mac=$(get_gateway_mac)
+        fi
         if [[ -n "$gw_mac" ]]; then
             local trusted_mac norm_trusted
             for trusted_mac in "${TRUSTED_GATEWAY_MACS[@]}"; do
@@ -388,28 +734,22 @@ wait_for_network_readiness() {
     return 1
 }
 
-cmd_check() {
-    if ! acquire_lock; then
-        log "Another instance of wireguard-auto is running. Exiting."
-        exit 0
-    fi
-    trap release_lock EXIT
+_cmd_check_locked() {
+    local skip_sleep="${1:-0}"
 
-    if [[ "${SKIP_CHECK_SLEEP:-0}" != "1" ]]; then
+    if [[ "$skip_sleep" != "1" && "${SKIP_CHECK_SLEEP:-0}" != "1" ]]; then
         # Allow network / DHCP / VPN handshakes to settle
         sleep 2
     fi
 
-    local current_ssid
+    local current_ssid current_gw_mac
     current_ssid=$(get_current_ssid)
+    current_gw_mac=$(get_gateway_mac)
 
     if is_disabled; then
         log "Auto-VPN is currently paused or disabled."
-        if is_wg_active; then
-            log "Tearing down $WG_INTERFACE because auto-vpn is disabled..."
-            "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        fi
-        exit 0
+        teardown_active_profiles || true
+        return 0
     fi
 
     if [[ "${#TRUSTED_SSIDS[@]}" -eq 0 && "${#TRUSTED_GATEWAY_MACS[@]}" -eq 0 ]]; then
@@ -420,42 +760,235 @@ cmd_check() {
         log "Warning: macOS redacted the Wi-Fi SSID (<redacted>) and no TRUSTED_GATEWAY_MACS are configured in $CONFIG_FILE. Configure TRUSTED_GATEWAY_MACS for macOS Sonoma/Sequoia/Tahoe support."
     fi
 
-    if is_trusted_network "$current_ssid"; then
+    if is_trusted_network "$current_ssid" "$current_gw_mac"; then
         log "Connected to trusted home network: '${current_ssid:-Gateway MAC Match}'."
-        if is_wg_active; then
-            log "Tearing down $WG_INTERFACE..."
-            "$WG_QUICK_BIN" down "$WG_INTERFACE"
-        else
+        if ! teardown_active_profiles; then
             log "WireGuard is already down."
         fi
-        exit 0
+        if is_full_mode_enabled; then
+            clear_full_mode_flag
+            log "Cleared full-tunnel override upon returning to trusted home network."
+        fi
+        return 0
     fi
 
     local net_desc="$current_ssid"
     if [[ -z "$net_desc" ]]; then
         if (( SSID_REDACTED == 1 )); then
             net_desc="Redacted Wi-Fi SSID"
+        elif [[ -n "$current_gw_mac" ]]; then
+            net_desc="Gateway $current_gw_mac"
         else
             net_desc="Non-WiFi / Cellular / Ethernet"
         fi
     fi
 
-    if is_wg_active; then
-        log "Away from home network ($net_desc). WireGuard ($WG_INTERFACE) is already active."
-        exit 0
+    local full_iface=""
+    full_iface=$(get_full_interface 2>/dev/null || true)
+
+    # Auto-reset full-tunnel mode back to split when connecting to a confirmed new network
+    if is_full_mode_enabled; then
+        if ! is_same_full_tunnel_network "$current_ssid" "$current_gw_mac"; then
+            log "Detected new network ($net_desc). Auto-resetting WireGuard mode from FULL back to SPLIT."
+            clear_full_mode_flag
+        fi
+    fi
+
+    local desired_iface="$WG_INTERFACE"
+    local other_iface="$full_iface"
+    local mode_label="SPLIT"
+
+    if is_full_mode_enabled; then
+        if [[ -n "$full_iface" && -f "${WG_DIR}/${full_iface}.conf" && ! -L "${WG_DIR}/${full_iface}.conf" ]]; then
+            desired_iface="$full_iface"
+            other_iface="$WG_INTERFACE"
+            mode_label="FULL"
+        else
+            log "Warning: Full-tunnel profile '${full_iface:-<invalid>}' is unavailable. Reverting to SPLIT mode."
+            clear_full_mode_flag
+        fi
+    fi
+
+    if [[ -n "$other_iface" ]] && is_profile_active "$other_iface"; then
+        log "Switching tunnel mode to ${mode_label}: tearing down $other_iface..."
+        bring_down_profile "$other_iface" || true
+    fi
+
+    if is_profile_active "$desired_iface"; then
+        sync_state_file "$desired_iface"
+        log "Away from home network ($net_desc). WireGuard ($desired_iface — ${mode_label}) is already active."
+        return 0
+    fi
+
+    if [[ "$mode_label" == "FULL" ]]; then
+        local conflict_iface=""
+        if conflict_iface=$(get_conflicting_vpn_interface); then
+            log "Another VPN ($conflict_iface) holds the default route. Postponing full-tunnel activation ($desired_iface)."
+            return 0
+        fi
     fi
 
     # Preflight check: Wait for default route and DNS readiness (coexisting with NordVPN auto-connect)
     local endpoint_host
-    endpoint_host=$(get_endpoint_host)
+    endpoint_host=$(get_endpoint_host "$desired_iface")
 
     if ! wait_for_network_readiness "$endpoint_host"; then
         log "Network route or DNS for '$endpoint_host' is not ready yet. Postponing connection until next trigger."
-        exit 0
+        return 0
     fi
 
-    log "Away from home network ($net_desc). Bringing up WireGuard ($WG_INTERFACE)..."
-    "$WG_QUICK_BIN" up "$WG_INTERFACE"
+    log "Away from home network ($net_desc). Bringing up WireGuard ($desired_iface — ${mode_label})..."
+    bring_up_profile "$desired_iface"
+}
+
+cmd_check() {
+    if ! acquire_lock; then
+        log "Another instance of wireguard-auto is running. Exiting."
+        exit 0
+    fi
+    if [[ "${WIREGUARD_AUTO_SOURCE_ONLY:-0}" != "1" ]]; then
+        trap release_lock EXIT
+    fi
+
+    local rc=0
+    _cmd_check_locked 0 || rc=$?
+    release_lock
+    return "$rc"
+}
+
+cmd_full() {
+    local force=0
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --force|-f)
+                force=1
+                ;;
+            *)
+                printf 'Unknown option for full: %s\nUsage: wireguard-auto full [--force]\n' "$arg" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        printf 'Elevating privileges to enable WireGuard full-tunnel mode...\n'
+        if (( force == 1 )); then
+            exec sudo "$0" full --force
+        else
+            exec sudo "$0" full
+        fi
+    fi
+
+    local full_iface=""
+    if ! full_iface=$(get_full_interface); then
+        printf 'Configuration Error: Derived full-tunnel profile name "%s-full" is invalid or exceeds 15 characters.\n' "$WG_INTERFACE" >&2
+        printf 'Set WG_FULL_INTERFACE explicitly in %s (1-15 chars, differing from WG_INTERFACE).\n' "$CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    if ! verify_profile_conf "$full_iface"; then
+        exit 1
+    fi
+
+    local current_ssid current_gw_mac
+    current_ssid=$(get_current_ssid)
+    current_gw_mac=$(get_gateway_mac)
+
+    if is_trusted_network "$current_ssid" "$current_gw_mac"; then
+        printf 'Error: Connected to trusted home network (%s). Full-tunnel mode is intended for untrusted networks.\n' "${current_ssid:-Gateway MAC Match}" >&2
+        exit 1
+    fi
+
+    if (( force == 0 )); then
+        local conflict_iface=""
+        if conflict_iface=$(get_conflicting_vpn_interface); then
+            printf 'Error: Another VPN (%s) currently holds the default route (e.g., NordVPN).\n' "$conflict_iface" >&2
+            printf 'Disconnect your other VPN first to avoid default-route conflicts, or override with:\n' >&2
+            printf '  wireguard-auto full --force\n' >&2
+            exit 1
+        fi
+    fi
+
+    if ! acquire_lock; then
+        printf 'Error: Another instance of wireguard-auto is currently running. Please retry.\n' >&2
+        exit 1
+    fi
+    if [[ "${WIREGUARD_AUTO_SOURCE_ONLY:-0}" != "1" ]]; then
+        trap release_lock EXIT
+    fi
+
+    rm -f "$TEMP_DISABLE_FLAG" "$PERSIST_DISABLE_FLAG"
+    write_full_mode_flag "$current_ssid" "$current_gw_mac"
+
+    local bound_desc="${current_ssid:-${current_gw_mac:-current network}}"
+
+    if is_profile_active "$full_iface"; then
+        sync_state_file "$full_iface"
+        printf 'WireGuard full-tunnel (%s) is already active (bound to: %s).\n' "$full_iface" "$bound_desc"
+        release_lock
+        return 0
+    fi
+
+    if is_profile_active "$WG_INTERFACE"; then
+        log "Switching from split-tunnel ($WG_INTERFACE) to full-tunnel ($full_iface)..."
+        bring_down_profile "$WG_INTERFACE" || true
+    fi
+
+    local endpoint_host
+    endpoint_host=$(get_endpoint_host "$full_iface")
+    if ! wait_for_network_readiness "$endpoint_host"; then
+        log "Network route or DNS for '$endpoint_host' is not ready yet. Aborting full-tunnel switch."
+        clear_full_mode_flag
+        printf 'Error: Network route or DNS for "%s" is not ready. Full-tunnel mode was not enabled.\n' "$endpoint_host" >&2
+        release_lock
+        exit 1
+    fi
+
+    log "Enabling full-tunnel WireGuard ($full_iface), bound to '$bound_desc'..."
+    if ! bring_up_profile "$full_iface"; then
+        log "Error: Failed to bring up full-tunnel ($full_iface). Reverting to SPLIT mode..."
+        clear_full_mode_flag
+        if wait_for_network_readiness "$(get_endpoint_host "$WG_INTERFACE")"; then
+            bring_up_profile "$WG_INTERFACE" || true
+        fi
+        release_lock
+        exit 1
+    fi
+
+    printf 'WireGuard full-tunnel (%s) ENABLED (bound to: %s).\n' "$full_iface" "$bound_desc"
+    printf "Mode will auto-reset to SPLIT when you join a new network, reboot, or run 'wireguard-auto split'.\n"
+    release_lock
+}
+
+cmd_split() {
+    if [[ $EUID -ne 0 && "${SKIP_ROOT_OWNERSHIP_CHECK:-0}" != "1" ]]; then
+        printf 'Elevating privileges to switch WireGuard back to split-tunnel mode...\n'
+        exec sudo "$0" split
+    fi
+
+    if ! acquire_lock; then
+        printf 'Error: Another instance of wireguard-auto is currently running. Please retry.\n' >&2
+        exit 1
+    fi
+    if [[ "${WIREGUARD_AUTO_SOURCE_ONLY:-0}" != "1" ]]; then
+        trap release_lock EXIT
+    fi
+
+    clear_full_mode_flag
+
+    local full_iface=""
+    full_iface=$(get_full_interface 2>/dev/null || true)
+    if [[ -n "$full_iface" ]] && is_profile_active "$full_iface"; then
+        log "Tearing down full-tunnel ($full_iface) to return to split-tunnel mode..."
+        bring_down_profile "$full_iface" || true
+    fi
+
+    printf 'WireGuard switched to SPLIT mode (default). Evaluating current network...\n'
+    local rc=0
+    _cmd_check_locked 1 || rc=$?
+    release_lock
+    return "$rc"
 }
 
 cmd_pause() {
@@ -469,10 +1002,8 @@ cmd_pause() {
     touch "$TEMP_DISABLE_FLAG"
     chmod 644 "$TEMP_DISABLE_FLAG" 2>/dev/null || true
     printf 'WireGuard auto-connect paused (temporary flag created at %s).\n' "$TEMP_DISABLE_FLAG"
-    if is_wg_active; then
-        "$WG_QUICK_BIN" down "$WG_INTERFACE"
-    else
-        printf 'WireGuard (%s) is already down.\n' "$WG_INTERFACE"
+    if ! teardown_active_profiles; then
+        printf 'WireGuard is already down.\n'
     fi
     printf "Run 'wireguard-auto resume' to re-enable auto-connect.\n"
 }
@@ -497,11 +1028,10 @@ cmd_disable() {
     fi
     touch "$PERSIST_DISABLE_FLAG"
     chmod 644 "$PERSIST_DISABLE_FLAG" 2>/dev/null || true
+    clear_full_mode_flag
     printf 'WireGuard auto-connect persistently disabled (flag created at %s).\n' "$PERSIST_DISABLE_FLAG"
-    if is_wg_active; then
-        "$WG_QUICK_BIN" down "$WG_INTERFACE"
-    else
-        printf 'WireGuard (%s) is already down.\n' "$WG_INTERFACE"
+    if ! teardown_active_profiles; then
+        printf 'WireGuard is already down.\n'
     fi
 }
 
@@ -574,8 +1104,12 @@ cmd_install_daemon() {
 # Note: This file is parsed declaratively (never sourced as shell code) and must
 # remain owned by root:wheel (chmod 644).
 
-# WireGuard interface name (corresponds to <BREW_PREFIX>/etc/wireguard/<WG_INTERFACE>.conf)
+# WireGuard split-tunnel interface name (corresponds to <BREW_PREFIX>/etc/wireguard/<WG_INTERFACE>.conf)
 WG_INTERFACE="homevpn"
+
+# Optional: WireGuard full-tunnel interface name for manual 'wireguard-auto full' mode.
+# Defaults to "<WG_INTERFACE>-full" (e.g., homevpn-full.conf) if omitted.
+# WG_FULL_INTERFACE="homevpn-full"
 
 # Trusted Wi-Fi networks where WireGuard should remain DISCONNECTED.
 # Add more SSIDs by placing them in double quotes inside the array.
@@ -695,7 +1229,7 @@ cmd_uninstall_daemon() {
         rmdir "$DAEMON_DIR" "$DAEMON_ROOT" 2>/dev/null || true
     fi
 
-    rm -f "${LOCK_DIR}/pid" "$TEMP_DISABLE_FLAG"
+    rm -f "${LOCK_DIR}/pid" "$TEMP_DISABLE_FLAG" "$FULL_TUNNEL_FLAG" "$STATE_FILE"
     rmdir "$LOCK_DIR" 2>/dev/null || true
 
     printf '==> Uninstalled wireguard-auto LaunchDaemon.\n'
@@ -706,7 +1240,7 @@ cmd_status() {
     local current_ssid
     current_ssid=$(get_current_ssid)
     local def_gw_int
-    def_gw_int=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}' | head -n 1)
+    def_gw_int=$(get_default_gateway_interface)
     local gw_mac
     gw_mac=$(get_gateway_mac)
 
@@ -719,20 +1253,43 @@ cmd_status() {
         ssid_display="<Not connected to Wi-Fi>"
     fi
 
+    local full_iface="" full_display
+    if full_iface=$(get_full_interface 2>/dev/null); then
+        if [[ -f "${WG_DIR}/${full_iface}.conf" ]]; then
+            full_display="${full_iface} (configured)"
+        else
+            full_display="${full_iface} (not found)"
+        fi
+    else
+        full_display="<Invalid derived name — set WG_FULL_INTERFACE>"
+    fi
+
+    local tunnel_mode_display="SPLIT (default)"
+    if is_full_mode_enabled; then
+        read_full_mode_flag || true
+        local bound_label="${FULL_BOUND_SSID:-${FULL_BOUND_MAC:-current network}}"
+        tunnel_mode_display="FULL (manual override — bound to: ${bound_label})"
+    fi
+
     printf '==============================================\n'
     printf '         WireGuard Auto-VPN Status            \n'
     printf '==============================================\n'
     printf 'Version             : v%s\n' "$VERSION"
     printf 'Homebrew Prefix     : %s\n' "$BREW_PREFIX"
-    printf 'Configured Profile  : %s\n' "$WG_INTERFACE"
+    printf 'Split Profile       : %s\n' "$WG_INTERFACE"
+    printf 'Full Profile        : %s\n' "$full_display"
     printf 'Trusted SSID(s)     : %s\n' "${TRUSTED_SSIDS[*]:-<None>}"
     printf 'Trusted Gateway MACs: %s\n' "${TRUSTED_GATEWAY_MACS[*]:-<None>}"
     printf 'Current SSID        : %s\n' "$ssid_display"
     printf 'Current Gateway MAC : %s\n' "${gw_mac:-<None>}"
     printf 'Default Gateway Int : %s\n' "${def_gw_int:-<None>}"
+    printf 'Tunnel Mode         : %s\n' "$tunnel_mode_display"
 
-    if is_wg_active; then
-        printf 'WireGuard Interface : UP (active)\n'
+    local active_utun=""
+    if [[ -n "$full_iface" ]] && active_utun=$(get_profile_utun "$full_iface"); then
+        printf 'WireGuard Interface : UP (%s on %s — full)\n' "$full_iface" "$active_utun"
+    elif active_utun=$(get_profile_utun "$WG_INTERFACE"); then
+        printf 'WireGuard Interface : UP (%s on %s — split)\n' "$WG_INTERFACE" "$active_utun"
     else
         printf 'WireGuard Interface : DOWN (inactive)\n'
     fi
@@ -759,6 +1316,8 @@ Usage: wireguard-auto [command]
 Commands:
   check             Evaluate network and activate/deactivate WireGuard (called by launchd)
   status            Show current Wi-Fi network, gateway MAC, WireGuard state, and mode
+  full [--force]    Manually switch to full-tunnel mode for the current untrusted network
+  split             Switch back to default split-tunnel mode immediately
   pause             Temporarily disable auto-connect and bring down WireGuard (captive portals)
   resume            Re-enable auto-connect and evaluate current network
   disable           Persistently disable auto-connect across reboots
@@ -808,6 +1367,13 @@ case "${1:-check}" in
         ;;
     status)
         cmd_status
+        ;;
+    full)
+        shift
+        cmd_full "$@"
+        ;;
+    split)
+        cmd_split
         ;;
     pause)
         cmd_pause
