@@ -29,6 +29,7 @@ At the same time, when working from coffee shops, airports, or hotels, I wanted 
 | **Coexists with Commercial VPNs (NordVPN)** | ❌ (All-or-nothing GUI routing breaks internet) | ❌ (Boot/wake race conditions) | ✅ (Daemon-level `utun` split-tunnel + preflight) |
 | **macOS Sonoma / Sequoia `<redacted>` SSID Support** | ❌ | ❌ | ✅ (Normalized Gateway ARP MAC fallback) |
 | **Captive Portal CLI Override (`pause` / `resume`)** | ❌ | ❌ | ✅ |
+| **Manual Full-Tunnel Toggle (`full` / `split`)** | ❌ | ❌ | ✅ (Network-bound auto-reset + VPN conflict guard) |
 
 ---
 
@@ -69,8 +70,8 @@ Because `wg-quick` requires `root` privileges to create `utun` kernel interfaces
 1. **Zero `source` / `eval` Config Parsing:** Unlike traditional shell daemons that run `source autovpn.conf` as `root`, `wireguard-auto` uses a strict, line-by-line declarative parser (`parse_config`). Arbitrary shell commands, backticks, or `$(...)` command substitutions inside `autovpn.conf` are never executed.
 2. **Root-Isolated Daemon Binary Path:** Because Homebrew prefixes (`/opt/homebrew/bin` on Apple Silicon and `/usr/local/bin` on Intel) are writable by standard local user accounts, `install.sh` places the actual daemon executable inside `/Library/Application Support/wireguard-auto/bin/wireguard-auto` (`root:wheel`, `0755`) and points `launchd` solely to that root-protected path. A convenience symlink is placed in `${BREW_PREFIX}/bin/wireguard-auto` for terminal CLI usage.
 3. **Config Ownership & Symlink Verification:** When invoked as `root`, `verify_config_security` refuses to read `autovpn.conf` if it is a symbolic link, not owned by `root` (`UID 0`), or group/world-writable.
-4. **Protected Runtime State in `/var/run`:** Concurrency locks (`/var/run/wireguard-auto.lock`) and temporary pause flags (`/var/run/wireguard-auto.paused`) reside in root/daemon-owned `/var/run` rather than world-writable `/tmp`, preventing symlink attacks and preventing unprivileged processes from silently tearing down the VPN without `sudo`.
-5. **Untrusted SSID & Interface Sanitization:** Over-the-air Wi-Fi SSIDs are treated as untrusted external strings (never evaluated or glob-expanded), and `WG_INTERFACE` is strictly validated against `^[a-zA-Z0-9_-]{1,15}$` to prevent path traversal.
+4. **Protected Runtime State in `/var/run`:** Concurrency locks (`/var/run/wireguard-auto.lock`), temporary pause flags (`/var/run/wireguard-auto.paused`), network-bound full-tunnel override flags (`/var/run/wireguard-auto.full`), and the non-sensitive active-tunnel status metadata (`/var/run/wireguard-auto.state`, `0644` so non-root `wireguard-auto status` works accurately while `/var/run/wireguard` stays `0700`) reside in root/daemon-owned `/var/run` rather than world-writable `/tmp`.
+5. **Untrusted SSID & Interface Sanitization:** Over-the-air Wi-Fi SSIDs are treated as untrusted external strings (never evaluated or glob-expanded), and both `WG_INTERFACE` and `WG_FULL_INTERFACE` are strictly validated against `^[a-zA-Z0-9_-]{1,15}$` to prevent path traversal.
 
 ---
 
@@ -106,6 +107,25 @@ AllowedIPs = 10.100.10.0/24, 10.100.11.0/24
 PersistentKeepalive = 25
 ```
 
+### 3. (Optional) Configure a Full-Tunnel Profile (`homevpn-full.conf`)
+When a hotel or corporate Wi-Fi blocks commercial VPNs (such as NordLynx) and you want to manually route **all** internet traffic through your home router (`wireguard-auto full`), create a companion `homevpn-full.conf` in the same WireGuard directory. Because only one profile runs at a time, you can reuse the **exact same client `PrivateKey` and `Address`** without adding a second peer on your UniFi router—only `AllowedIPs` (and optional Pi-hole `DNS`) changes:
+
+```ini
+[Interface]
+PrivateKey = <REDACTED_CLIENT_PRIVATE_KEY>
+Address = 10.100.10.2/32
+DNS = 10.100.11.4
+
+[Peer]
+PublicKey = <REDACTED_SERVER_PUBLIC_KEY>
+Endpoint = 203.0.113.50:51820
+# Route all internet traffic through your home router
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+```
+
+Lock down permissions (`sudo chown root:wheel <path> && sudo chmod 600 <path>`, or run `sudo wireguard-auto install-daemon`).
+
 ---
 
 ## 🚀 Installation & Configuration
@@ -138,14 +158,16 @@ sudo ./install.sh
    ==============================================
             WireGuard Auto-VPN Status            
    ==============================================
-   Version             : v1.0.0
+   Version             : v1.1.0
    Homebrew Prefix     : /opt/homebrew
-   Configured Profile  : homevpn
+   Split Profile       : homevpn
+   Full Profile        : homevpn-full (configured)
    Trusted SSID(s)     : Your-Home-WiFi-SSID
    Trusted Gateway MACs: <None>
    Current SSID        : <Redacted by macOS Privacy — use TRUSTED_GATEWAY_MACS>
    Current Gateway MAC : 78:45:58:xx:xx:xx
    Default Gateway Int : en0
+   Tunnel Mode         : SPLIT (default)
    WireGuard Interface : DOWN (inactive)
    Auto-Connect Mode   : ENABLED (automatic)
    ==============================================
@@ -157,6 +179,8 @@ sudo ./install.sh
    ```
    ```bash
    WG_INTERFACE="homevpn"
+   # Optional: defaults to "<WG_INTERFACE>-full" (homevpn-full.conf)
+   # WG_FULL_INTERFACE="homevpn-full"
 
    # Used on macOS Monterey / Ventura (or when SSID is visible)
    TRUSTED_SSIDS=(
@@ -180,12 +204,14 @@ sudo ./install.sh
 ## 💻 CLI Usage
 
 ```text
-wireguard-auto v1.0.0
+wireguard-auto v1.1.0
 Usage: wireguard-auto [command]
 
 Commands:
   check             Evaluate network and activate/deactivate WireGuard (called by launchd)
   status            Show current Wi-Fi network, gateway MAC, WireGuard state, and mode
+  full [--force]    Manually switch to full-tunnel mode for the current untrusted network
+  split             Switch back to default split-tunnel mode immediately
   pause             Temporarily disable auto-connect and bring down WireGuard (captive portals)
   resume            Re-enable auto-connect and evaluate current network
   disable           Persistently disable auto-connect across reboots
@@ -195,6 +221,21 @@ Commands:
   version           Display version information
   help              Display this help message
 ```
+
+### Manual Full-Tunnel Mode (Restrictive Hotel / Public Wi-Fi)
+Split-tunnel mode is always the default so `wireguard-auto` coexists cleanly with NordVPN. When a hotel Wi-Fi blocks NordLynx or you want to route all traffic through your home router and Pi-hole:
+```bash
+# 1. Disconnect NordVPN (wireguard-auto refuses to collide with an active commercial VPN unless --force is passed)
+
+# 2. Switch to full-tunnel mode (bound to your current Wi-Fi SSID / Gateway MAC)
+wireguard-auto full
+
+# 3. Return to default split-tunnel mode at any time (or simply connect to a different Wi-Fi network)
+wireguard-auto split
+```
+
+> [!NOTE]
+> **Network-Bound Auto-Reset:** `wireguard-auto full` binds full-tunnel mode to the **current network** (SSID when visible, or Gateway MAC on macOS Sonoma/Sequoia/Tahoe). It stays active across lid close/open and brief Wi-Fi drops at your hotel, then **automatically resets back to `split` mode** as soon as you connect to a different network (e.g., Starbucks, airport, or home Wi-Fi) or reboot.
 
 ### Captive Portal Workflow (Hotels / Flights / Cafes)
 When joining a public Wi-Fi network that requires a browser login splash page before granting internet access:

@@ -4,8 +4,12 @@
 # Note: This file is parsed declaratively (never sourced as shell code) and must
 # remain owned by root:wheel (chmod 644).
 
-# WireGuard interface name (corresponds to <BREW_PREFIX>/etc/wireguard/<WG_INTERFACE>.conf)
+# WireGuard split-tunnel interface name (corresponds to <BREW_PREFIX>/etc/wireguard/<WG_INTERFACE>.conf)
 WG_INTERFACE="homevpn"
+
+# Optional: WireGuard full-tunnel interface name for manual 'wireguard-auto full' mode.
+# Defaults to "<WG_INTERFACE>-full" (e.g., homevpn-full.conf) if omitted.
+# WG_FULL_INTERFACE="homevpn-full"
 
 # Trusted Wi-Fi networks where WireGuard should remain DISCONNECTED.
 # Add more SSIDs by placing them in double quotes inside the array.
